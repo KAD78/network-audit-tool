@@ -1,4 +1,3 @@
-Python
 PyQt6
 reportlab
 python-docx
