@@ -1,0 +1,4 @@
+Python 3.10+
+PyQt6
+reportlab
+python-docx
