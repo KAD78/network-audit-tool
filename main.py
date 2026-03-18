@@ -1,5 +1,257 @@
 #!/usr/bin/env python3
 import asyncio, ipaddress, sys, csv
+
+# ===== GUI DETECTION =====
+GUI_AVAILABLE = True
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QPushButton, QLineEdit, QTextEdit,
+        QLabel, QMessageBox, QCheckBox
+    )
+except:
+    GUI_AVAILABLE = False
+
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table as PDFTable
+from docx import Document
+
+TIMEOUT = 1
+MAX_CONCURRENT = 1000
+
+
+COMMON_PORTS = [
+    21,22,23,25,53,80,110,143,443,3389,3306,5432,6379,8080,8443
+]
+
+SERVICE_PORTS = {
+    21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",
+    67:"DHCP",69:"TFTP",80:"HTTP",110:"POP3",119:"NNTP",
+    123:"NTP",137:"NetBIOS",138:"NetBIOS",139:"SMB",
+    143:"IMAP",161:"SNMP",179:"BGP",389:"LDAP",443:"HTTPS",
+    445:"SMB",465:"SMTPS",500:"ISAKMP",514:"Syslog",515:"Printer",
+    520:"RIP",587:"SMTP",636:"LDAPS",989:"FTPS",990:"FTPS",
+    1433:"MSSQL",1521:"Oracle",2049:"NFS",2082:"cPanel",2083:"cPanel SSL",
+    2181:"Zookeeper",2375:"Docker",2483:"Oracle SSL",3000:"NodeJS",
+    3128:"Proxy",3306:"MySQL",3389:"RDP",3690:"SVN",4444:"Metasploit",
+    4567:"Rails",5000:"Flask",5432:"PostgreSQL",5601:"Kibana",5672:"RabbitMQ",
+    5900:"VNC",5985:"WinRM",5986:"WinRM SSL",6379:"Redis",6667:"IRC",
+    7001:"WebLogic",7002:"WebLogic SSL",7077:"Spark",7199:"Cassandra",
+    7474:"Neo4j",7777:"Game Server",8000:"HTTP Alt",8080:"HTTP Proxy",
+    8443:"HTTPS Alt",9000:"SonarQube",9042:"Cassandra",9092:"Kafka",
+    9200:"Elasticsearch",9418:"Git",9999:"Java Debug"
+}
+
+
+def detect_service(port):
+    return SERVICE_PORTS.get(port,"Unknown")
+
+# ================= SCAN =================
+async def scan_port(ip, port):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port),
+            timeout=TIMEOUT
+        )
+        writer.close()
+        await writer.wait_closed()
+        return port
+    except:
+        return None
+
+async def run_scan(target, ports):
+    ips = expand_targets(target)
+    results = []
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+    async def sem_scan(ip, port):
+        async with sem:
+            return await scan_port(ip, port)
+
+    tasks = []
+    for ip in ips:
+        for port in ports:
+            tasks.append(sem_scan(ip, port))
+
+    responses = await asyncio.gather(*tasks)
+
+    i = 0
+    for ip in ips:
+        for port in ports:
+            if responses[i]:
+                results.append({
+                    "ip": ip,
+                    "port": port,
+                    "service": detect_service(port)
+                })
+            i += 1
+
+    return results
+
+def expand_targets(target):
+    try:
+        net = ipaddress.ip_network(target, strict=False)
+        return [str(ip) for ip in net.hosts()]
+    except:
+        return [target]
+
+def parse_ports(text):
+    ports = set()
+    for part in text.split(","):
+        if "-" in part:
+            start,end = part.split("-")
+            ports.update(range(int(start), int(end)+1))
+        else:
+            ports.add(int(part.strip()))
+    return sorted(ports)
+
+# ================= EXPORT =================
+def export_pdf(results):
+    data = [["IP","Port","Service"]]
+    for r in results:
+        data.append([r["ip"], str(r["port"]), r["service"]])
+    pdf = SimpleDocTemplate("scan_report.pdf", pagesize=letter)
+    pdf.build([PDFTable(data)])
+
+def export_docx(results):
+    doc = Document()
+    doc.add_heading("Network Scan Report",0)
+    table = doc.add_table(rows=1, cols=3)
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text = "IP","Port","Service"
+    for r in results:
+        row = table.add_row().cells
+        row[0].text = r["ip"]
+        row[1].text = str(r["port"])
+        row[2].text = r["service"]
+    doc.save("scan_report.docx")
+
+def export_csv(results):
+    with open("scan_report.csv","w",newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["ip","port","service"])
+        writer.writeheader()
+        writer.writerows(results)
+
+# ================= CLI =================
+def run_cli():
+    print("\n=== Network Audit Tool ===\n")
+
+    target = input("Target IP / CIDR: ")
+    ports_input = input("Ports (ex: 22,80 or 20-1024): ")
+
+    if not ports_input:
+        ports = COMMON_PORTS
+    else:
+        ports = parse_ports(ports_input)
+
+    print("\nScanning...\n")
+    results = asyncio.run(run_scan(target, ports))
+
+    if not results:
+        print("No open ports found.")
+        return
+
+    for r in results:
+        print(f"{r['ip']}:{r['port']} -> {r['service']}")
+
+    export_pdf(results)
+    export_docx(results)
+    export_csv(results)
+
+    print("\nReports generated!")
+
+# ================= GUI =================
+if GUI_AVAILABLE:
+
+    class ScannerGUI(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Network Audit Tool")
+            self.resize(600,600)
+
+            layout = QVBoxLayout()
+
+            layout.addWidget(QLabel("Target IP / CIDR:"))
+            self.target_input = QLineEdit()
+            layout.addWidget(self.target_input)
+
+            layout.addWidget(QLabel("Ports:"))
+            self.port_input = QLineEdit("20-1024")
+            layout.addWidget(self.port_input)
+
+            self.pdf_cb = QCheckBox("PDF")
+            self.pdf_cb.setChecked(True)
+
+            self.docx_cb = QCheckBox("DOCX")
+            self.docx_cb.setChecked(True)
+
+            self.csv_cb = QCheckBox("CSV")
+            self.csv_cb.setChecked(True)
+
+            layout.addWidget(self.pdf_cb)
+            layout.addWidget(self.docx_cb)
+            layout.addWidget(self.csv_cb)
+
+            btn = QPushButton("Start Scan")
+            btn.clicked.connect(self.start_scan)
+            layout.addWidget(btn)
+
+            self.output = QTextEdit()
+            self.output.setReadOnly(True)
+            layout.addWidget(self.output)
+
+            self.setLayout(layout)
+
+        def start_scan(self):
+            target = self.target_input.text()
+            ports_text = self.port_input.text()
+
+            if not target:
+                QMessageBox.warning(self,"Error","Enter target")
+                return
+
+            try:
+                ports = parse_ports(ports_text)
+            except:
+                QMessageBox.warning(self,"Error","Invalid ports")
+                return
+
+            self.output.clear()
+            results = asyncio.run(run_scan(target, ports))
+
+            if not results:
+                self.output.append("No open ports found.")
+                return
+
+            for r in results:
+                self.output.append(f"{r['ip']}:{r['port']} -> {r['service']}")
+
+            if self.pdf_cb.isChecked(): export_pdf(results)
+            if self.docx_cb.isChecked(): export_docx(results)
+            if self.csv_cb.isChecked(): export_csv(results)
+
+            self.output.append("\nReports generated!")
+
+# ================= ENTRY =================
+if __name__ == "__main__":
+    if GUI_AVAILABLE:
+        try:
+            app = QApplication(sys.argv)
+            win = ScannerGUI()
+            win.show()
+            sys.exit(app.exec())
+        except:
+            run_cli()
+    else:
+        run_cli()
+
+
+
+
+"""
+
+#!/usr/bin/env python3
+import asyncio, ipaddress, sys, csv
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit,
     QLabel, QMessageBox, QCheckBox, QScrollArea, QGridLayout
@@ -189,6 +441,8 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+"""
 
 """
 
