@@ -1,4 +1,237 @@
 #!/usr/bin/env python3
+import asyncio, ipaddress, sys, csv, socket
+
+# ===== GUI DETECTION =====
+GUI_AVAILABLE = True
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QWidget, QVBoxLayout, QPushButton, QLineEdit,
+        QTextEdit, QLabel, QMessageBox, QCheckBox, QProgressBar
+    )
+except:
+    GUI_AVAILABLE = False
+
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table as PDFTable
+from docx import Document
+
+TIMEOUT = 1
+MAX_CONCURRENT = 800
+
+# ===== SERVICES =====
+SERVICE_PORTS = {
+    21:"FTP",22:"SSH",23:"Telnet",25:"SMTP",53:"DNS",
+    80:"HTTP",110:"POP3",143:"IMAP",443:"HTTPS",
+    3306:"MySQL",3389:"RDP",5432:"PostgreSQL",
+    6379:"Redis",8080:"HTTP Alt",8443:"HTTPS Alt"
+}
+
+def detect_service(port):
+    return SERVICE_PORTS.get(port,"Unknown")
+
+# ===== BANNER GRABBING =====
+async def grab_banner(ip, port):
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=TIMEOUT
+        )
+
+        # HTTP
+        if port in [80,8080,8000]:
+            writer.write(b"HEAD / HTTP/1.0\r\n\r\n")
+            await writer.drain()
+
+        data = await asyncio.wait_for(reader.read(1024), timeout=TIMEOUT)
+        writer.close()
+        await writer.wait_closed()
+
+        return data.decode(errors="ignore").strip().split("\n")[0][:100]
+    except:
+        return ""
+
+# ===== SCAN =====
+async def scan_port(ip, port, sem, progress_cb=None):
+    async with sem:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=TIMEOUT
+            )
+            writer.close()
+            await writer.wait_closed()
+
+            banner = await grab_banner(ip, port)
+
+            if progress_cb:
+                progress_cb()
+
+            return {
+                "ip": ip,
+                "port": port,
+                "service": detect_service(port),
+                "banner": banner
+            }
+        except:
+            if progress_cb:
+                progress_cb()
+            return None
+
+async def run_scan(target, ports, progress_cb=None):
+    ips = expand_targets(target)
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+    tasks = []
+    for ip in ips:
+        for port in ports:
+            tasks.append(scan_port(ip, port, sem, progress_cb))
+
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
+
+# ===== UTILS =====
+def expand_targets(target):
+    try:
+        net = ipaddress.ip_network(target, strict=False)
+        return [str(ip) for ip in net.hosts()]
+    except:
+        return [target]
+
+def parse_ports(text):
+    ports = set()
+    for part in text.split(","):
+        if "-" in part:
+            start,end = part.split("-")
+            ports.update(range(int(start), int(end)+1))
+        else:
+            ports.add(int(part.strip()))
+    return sorted(ports)
+
+# ===== EXPORT =====
+def export_csv(results):
+    with open("scan.csv","w",newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["ip","port","service","banner"])
+        writer.writeheader()
+        writer.writerows(results)
+
+def export_pdf(results):
+    data = [["IP","Port","Service","Banner"]]
+    for r in results:
+        data.append([r["ip"],str(r["port"]),r["service"],r["banner"]])
+    pdf = SimpleDocTemplate("scan.pdf", pagesize=letter)
+    pdf.build([PDFTable(data)])
+
+def export_docx(results):
+    doc = Document()
+    doc.add_heading("Scan Report",0)
+    table = doc.add_table(rows=1, cols=4)
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text, hdr[3].text = "IP","Port","Service","Banner"
+    for r in results:
+        row = table.add_row().cells
+        row[0].text = r["ip"]
+        row[1].text = str(r["port"])
+        row[2].text = r["service"]
+        row[3].text = r["banner"]
+    doc.save("scan.docx")
+
+# ===== CLI =====
+def run_cli():
+    target = input("Target: ")
+    ports = parse_ports(input("Ports: "))
+
+    total = len(ports) * len(expand_targets(target))
+    done = 0
+
+    def progress():
+        nonlocal done
+        done += 1
+        print(f"\rProgress: {done}/{total}", end="")
+
+    results = asyncio.run(run_scan(target, ports, progress))
+
+    print("\n\nResults:")
+    for r in results:
+        print(f"{r['ip']}:{r['port']} -> {r['service']} | {r['banner']}")
+
+    export_csv(results)
+    export_pdf(results)
+    export_docx(results)
+
+    print("\nReports generated!")
+
+# ===== GUI =====
+if GUI_AVAILABLE:
+
+    class ScannerGUI(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle("Network Audit PRO")
+            layout = QVBoxLayout()
+
+            self.target = QLineEdit()
+            self.target.setPlaceholderText("IP / CIDR")
+
+            self.ports = QLineEdit("20-1024")
+
+            self.progress = QProgressBar()
+
+            self.output = QTextEdit()
+
+            btn = QPushButton("Start Scan")
+            btn.clicked.connect(self.start_scan)
+
+            layout.addWidget(self.target)
+            layout.addWidget(self.ports)
+            layout.addWidget(self.progress)
+            layout.addWidget(btn)
+            layout.addWidget(self.output)
+
+            self.setLayout(layout)
+
+        def start_scan(self):
+            target = self.target.text()
+            ports = parse_ports(self.ports.text())
+
+            total = len(ports) * len(expand_targets(target))
+            done = 0
+
+            def progress():
+                nonlocal done
+                done += 1
+                percent = int((done/total)*100)
+                self.progress.setValue(percent)
+
+            results = asyncio.run(run_scan(target, ports, progress))
+
+            for r in results:
+                self.output.append(f"{r['ip']}:{r['port']} -> {r['service']} | {r['banner']}")
+
+            export_csv(results)
+            export_pdf(results)
+            export_docx(results)
+
+# ===== ENTRY =====
+if __name__ == "__main__":
+    if GUI_AVAILABLE:
+        try:
+            app = QApplication(sys.argv)
+            win = ScannerGUI()
+            win.show()
+            sys.exit(app.exec())
+        except:
+            run_cli()
+    else:
+        run_cli()
+
+
+
+
+
+
+
+
+
+"""
+#!/usr/bin/env python3
 import asyncio, ipaddress, sys, csv, os
 
 # ===== Détection PyQt6 =====
@@ -212,6 +445,7 @@ if __name__ == "__main__":
         run_cli()
 
 
+"""
 
 
 
